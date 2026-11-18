@@ -56,14 +56,27 @@
 <header>
   <h1>写入切流控制台</h1>
   <span>现役节点：<span id="active" class="badge b-info">-</span></span>
+  <span>接流状态：<span id="pausestate" class="badge b-mut">-</span></span>
   <span class="muted" id="clock"></span>
   <span style="flex:1"></span>
   <label class="muted"><input type="checkbox" id="autopoll" checked> 每 2 秒自动刷新</label>
 </header>
 
 <main>
+  <section class="card" id="backupCard">
+    <h2>备份窗口：暂停接流 → 等待静默 → 可备份（暂停状态持久保存，代理重启后仍有效，只能手动恢复）</h2>
+    <div class="row">
+      <button class="danger" id="pauseBtn">暂停接流</button>
+      <button class="primary" id="resumeBtn">恢复接流</button>
+      <input type="text" id="pauseNote" placeholder="暂停备注（可选），如：备份 proxy/A/B 数据卷">
+      <button id="verifyAll">核实全部待核写入</button>
+    </div>
+    <div id="readiness" style="margin-top:12px"></div>
+    <div id="blockers" style="margin-top:10px"></div>
+  </section>
+
   <section class="card">
-    <h2>节点与切流（探测失败会保留旧路由；切流不打断在途写入，回执仍从原节点取）</h2>
+    <h2>节点与切流（探测失败会保留旧路由；切流不打断在途写入，回执仍从原节点取）<span id="switchlock"></span></h2>
     <div class="grid2" id="nodes"></div>
   </section>
 
@@ -74,7 +87,8 @@
       <label class="muted">慢回执延迟(秒) <input type="number" id="delay" value="8" min="0" step="0.5"></label>
       <button class="primary" id="send">投递写入</button>
     </div>
-    <p class="muted" style="margin:10px 0 0">提示：延迟设 8~15 秒后点投递，在返回前立刻点另一节点的"切换流量"，即可演练在途切流。</p>
+    <p class="muted" style="margin:10px 0 0">提示：延迟设 8~15 秒后点投递，在返回前立刻点另一节点的"切换流量"，即可演练在途切流。
+      暂停接流期间投递会立即收到 <code>503 INTAKE_PAUSED</code>（未受理：不落台账、不投后端）。</p>
   </section>
 
   <section class="card">
@@ -119,7 +133,8 @@ function fmt(ts){ return ts ? new Date(ts*1000).toLocaleTimeString('zh-CN',{hour
 function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function statusBadge(s){
   const map = {ACKED:['b-ok','已回执 ACKED'], PENDING:['b-warn','待回执 PENDING'],
-    TIMEOUT_UNCERTAIN:['b-bad','结果不确定 TIMEOUT'], FAILED:['b-bad','失败 FAILED']};
+    TIMEOUT_UNCERTAIN:['b-bad','结果不确定 TIMEOUT'], FAILED:['b-bad','失败 FAILED'],
+    NOT_ACCEPTED:['b-mut','确知未受理 NOT_ACCEPTED']};
   const [cls,label] = map[s] || ['b-mut',s];
   return `<span class="badge ${cls}">${label}</span>`;
 }
@@ -137,6 +152,40 @@ async function switchTo(target){
     await refresh();
   }catch(e){ toast('切流被拦截，保持旧路由：'+e.message, false); await refresh(); }
 }
+async function pauseIntake(){
+  try{
+    const note = $('#pauseNote').value.trim();
+    const r = await api('/api/pause', {method:'POST', body:JSON.stringify({note})});
+    toast(`已暂停接流（持久生效）：新写入即拒、切流锁定；当前待核写入 ${r.blocking_writes} 条`);
+    await refresh();
+  }catch(e){ toast('暂停失败：'+e.message, false); }
+}
+async function resumeIntake(){
+  try{
+    await api('/api/resume', {method:'POST', body:'{}'});
+    toast('已恢复接流'); await refresh();
+  }catch(e){ toast('恢复失败：'+e.message, false); }
+}
+$('#pauseBtn').onclick = pauseIntake;
+$('#resumeBtn').onclick = resumeIntake;
+$('#verifyAll').onclick = async () => {
+  const btn = $('#verifyAll'); btn.disabled = true;
+  try{
+    const s = await api('/api/status');
+    const bl = (s.backup && s.backup.blockers) || [];
+    if(!bl.length){ toast('没有待核写入'); return; }
+    toast(`开始向原节点核实 ${bl.length} 条待核写入（慢回执会等待其完成）……`);
+    for(const b of bl){
+      try{ await api(`/api/writes/${encodeURIComponent(b.id)}/refresh?wait=1`); }
+      catch(e){ /* 单条失败继续下一条，状态区会显示 */ }
+    }
+    await refresh();
+    const s2 = await api('/api/status');
+    const left = (s2.backup && s2.backup.blocking_count) || 0;
+    toast(left ? `仍有 ${left} 条未确认（节点失联或回执未完成），不显示可备份`
+               : '全部待核写入已确认', !left);
+  }finally{ btn.disabled = false; }
+};
 async function setFault(name, on){
   await api(`/api/nodes/${name}/fault`, {method:'POST', body:JSON.stringify({on})});
   toast(`节点 ${name} 健康故障注入：${on?'开启':'解除'}`); await refresh();
@@ -148,7 +197,7 @@ async function loadRecords(name){
   }catch(e){ $('#rec'+name).textContent = '加载失败：'+e.message; }
 }
 async function refreshOne(id){
-  try{ const r = await api(`/api/writes/${encodeURIComponent(id)}/refresh`);
+  try{ const r = await api(`/api/writes/${encodeURIComponent(id)}/refresh?wait=1`);
     toast(r.note ? r.note : `已向原节点 ${r.write.target_node} 查询：${r.write.status}`);
     await refresh();
   }catch(e){ toast('查询失败：'+e.message, false); }
@@ -165,7 +214,8 @@ $('#send').onclick = async () => {
     toast(`写入 ${r.id} 已由节点 ${r.node} 回执（耗时 ${((Date.now()-t0)/1000).toFixed(1)}s）`);
   }catch(e){
     const d = e.data || {};
-    if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
+    if(d.status === 'INTAKE_PAUSED') toast('⏸ 接流已暂停：该写入未受理（未落台账、未投后端）', false);
+    else if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
     else toast('写入失败：'+e.message, false);
   }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); }
 };
@@ -175,6 +225,37 @@ async function refresh(){
   try{ s = await api('/api/status'); }catch(e){ return; }
   $('#clock').textContent = new Date(s.ts*1000).toLocaleString('zh-CN',{hour12:false});
   $('#active').textContent = s.active;
+
+  // ---- 备份窗口：暂停状态 + 静默判定 + 待核写入列表
+  const paused = !!(s.pause && s.pause.paused);
+  const bk = s.backup || {ready:false, blockers:[], blocking_count:0, unreachable_count:0};
+  $('#pausestate').textContent = paused ? '已暂停 PAUSED' : '接流中';
+  $('#pausestate').className = 'badge ' + (paused ? 'b-warn' : 'b-ok');
+  $('#pauseBtn').disabled = paused;
+  $('#resumeBtn').disabled = !paused;
+  $('#switchlock').innerHTML = paused ? ' <span class="badge b-warn">暂停期间切流已锁定</span>' : '';
+  let rhtml;
+  if(!paused){
+    rhtml = `<span class="badge b-mut">接流中</span> <span class="muted">未进入备份窗口；点"暂停接流"后才开始评估静默。暂停后新写入即拒（503）、切流锁定。</span>`;
+  }else if(bk.ready){
+    rhtml = `<span class="badge b-ok">已静默，可备份 READY</span> 全部已受理写入均已确认（或确知未受理）。现在可安全备份 proxy 与两个后端的数据卷；备份完成后点"恢复接流"。`;
+  }else{
+    rhtml = `<span class="badge b-warn">未静默 NOT QUIET</span> ${bk.blocking_count} 条写入待核（在途/结果不确定），全部确认或确知未受理后才显示可备份。`;
+    if(bk.unreachable_count) rhtml += `<br><span class="badge b-bad">节点失联</span> <span style="color:var(--bad)">${bk.unreachable_count} 条待核写入的原节点不可达，无法核实——绝不会误报可备份。</span>`;
+  }
+  $('#readiness').innerHTML = rhtml;
+  $('#blockers').innerHTML = (bk.blockers && bk.blockers.length) ? `<table>
+    <thead><tr><th>写入 ID</th><th>原节点</th><th>状态</th><th>节点可达</th><th>说明</th><th></th></tr></thead>
+    <tbody>${bk.blockers.map(b => `<tr>
+      <td class="mono" title="${esc(b.id)}">${esc(b.id.slice(0,8))}…</td>
+      <td><span class="badge b-info">${esc(b.target_node)}</span></td>
+      <td>${statusBadge(b.status)}</td>
+      <td>${b.node_reachable?'<span class="badge b-ok">可达</span>':'<span class="badge b-bad">失联</span>'}</td>
+      <td class="muted" style="max-width:340px">${esc(b.status_detail)}</td>
+      <td><button onclick="refreshOne('${esc(b.id)}')">向原节点查询</button></td>
+    </tr>`).join('')}</tbody></table>`
+    : (paused ? '<p class="muted" style="margin:6px 0 0">无阻塞写入：没有在途或结果不确定的写入。</p>' : '');
+
   $('#nodes').innerHTML = Object.entries(s.nodes).map(([name, h]) => {
     const d = s.drainage[name] || {};
     const isActive = name === s.active;
@@ -193,7 +274,7 @@ async function refresh(){
         <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.failed??0}</span>
       </div>
       <div class="row">
-        <button class="primary" ${isActive?'disabled':''} onclick="switchTo('${esc(name)}')">切换流量到 ${esc(name)}</button>
+        <button class="primary" ${(isActive||paused)?'disabled':''} title="${paused?'暂停接流期间禁止切流':''}" onclick="switchTo('${esc(name)}')">切换流量到 ${esc(name)}</button>
         <button class="danger" onclick="setFault('${esc(name)}', true)">注入健康故障</button>
         <button onclick="setFault('${esc(name)}', false)">解除故障</button>
       </div>

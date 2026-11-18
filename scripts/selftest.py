@@ -9,7 +9,16 @@
   4. 连续两次切流都不打断各自的在途写入（再次切流安全）；
   5. 回执超时：返回 504 + TIMEOUT_UNCERTAIN，不自动补投；
      事后向"原送达节点"查询可确认其实已落库并回执；
-  6. 全量核对：两侧后端写入 ID 集合不相交，每条写入恰好出现一次。
+  6. 全量核对：两侧后端写入 ID 集合不相交，每条写入恰好出现一次；
+  7. 暂停接流：新写入立即 503 拒绝（不落台账、不投后端），在途写入继续取回执，
+     切流被锁定（409），全部确认后显示可备份，手动恢复后写入正常；
+  8. 暂停与并发写入交错：受理边界清晰——每条写入要么完整受理（台账+后端齐全），
+     要么干净拒绝（台账与后端都无痕迹），已受理的一条不丢；
+  9. 待核写入的原节点失联（杀后端进程）：无法核实，绝不误报可备份；
+     节点恢复后核实为已落库，状态更正 ACKED；
+ 10. 代理重启：暂停状态与待核记录仍有效（新写入仍拒、切流仍锁），
+     值班员手动核实（确认 / 确知未受理）后才显示可备份，再手动恢复接流；
+ 11. 终态全量核对：ACKED 与后端记录一一对应，FAILED/NOT_ACCEPTED 两侧后端均无记录。
 
 用法:
   python3 -I scripts/selftest.py [--python /path/to/venv/python]
@@ -28,6 +37,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +66,8 @@ def http(method: str, url: str, body: dict | None = None, timeout: float = 30):
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode())
+    except Exception as e:  # 连接被重置/拒接等（如代理被杀）：返回 0 供断言
+        return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
 def wait_ready(url: str, timeout: float = 20) -> bool:
@@ -68,6 +80,17 @@ def wait_ready(url: str, timeout: float = 20) -> bool:
         except Exception:
             time.sleep(0.3)
     return False
+
+
+def wait_for(fn, timeout: float = 15, interval: float = 0.15, desc: str = "condition"):
+    """轮询直到 fn() 返回真值，返回该真值；超时抛 AssertionError。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        v = fn()
+        if v:
+            return v
+        time.sleep(interval)
+    raise AssertionError(f"timeout waiting for {desc}")
 
 
 def wait_status(proxy: str, write_id: str, expect: str, timeout: float = 15) -> dict:
@@ -105,17 +128,36 @@ def main() -> int:
     logs = work / "logs"
     logs.mkdir()
     procs: list[subprocess.Popen] = []
+    handles: dict[str, subprocess.Popen] = {}
+    envs: dict[str, dict] = {}
     ports = {"proxy": 18000, "A": 18001, "B": 18002}
     proxy = f"http://127.0.0.1:{ports['proxy']}"
 
     def spawn(kind: str, app_dir: Path, env: dict, port: int) -> None:
-        log = open(logs / f"{kind}.log", "wb")
+        log = open(logs / f"{kind}.log", "ab")
         p = subprocess.Popen(
             [args.python, "-I", "-m", "uvicorn", "app.main:app",
              "--host", "127.0.0.1", "--port", str(port), "--app-dir", str(app_dir)],
             env={**os.environ, **env}, stdout=log, stderr=subprocess.STDOUT,
         )
         procs.append(p)
+        handles[kind] = p
+        envs[kind] = (app_dir, env, port)
+
+    def respawn(kind: str) -> None:
+        """按原参数重启一个进程（复用同一数据目录/端口）。"""
+        app_dir, env, port = envs[kind]
+        spawn(kind, app_dir, env, port)
+
+    def stop_proc(kind: str, hard: bool = False) -> None:
+        p = handles[kind]
+        if p.poll() is None:
+            p.kill() if hard else p.terminate()
+            try:
+                p.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=5)
 
     try:
         print("== 启动两个后端 + 代理（读回执超时 2s，便于演练超时场景） ==")
@@ -261,10 +303,279 @@ def main() -> int:
             check(n == len(ids_a if node == "A" else ids_b),
                   f"后端 {node} 的 SQLite 持久化写入数 = {n}")
 
+        print("\n== 场景 7：暂停接流 —— 新写入即拒、在途续跑、切流锁定、静默后可备份 ==")
+        _, s = http("GET", f"{proxy}/api/status")
+        check(s["pause"]["paused"] is False and s["backup"]["ready"] is False,
+              "未暂停时：接流中，不显示可备份")
+
+        slow = SlowPost(proxy, 1.6, "pause-inflight")
+        slow.start()
+        pid = None
+        try:
+            pid = wait_for(lambda: next(
+                (w["id"] for w in http("GET", f"{proxy}/api/status")[1]["writes"]
+                 if w["status"] == "PENDING"), None),
+                timeout=8, desc="PENDING row of pause-inflight")
+        except AssertionError:
+            pass
+        check(bool(pid), "慢写入进入 PENDING（暂停演练就绪）")
+
+        code, pz = http("POST", f"{proxy}/api/pause", {"note": "备份演练"})
+        check(code == 200 and pz.get("paused") is True, "暂停接流开启（持久）")
+
+        code, rej = http("POST", f"{proxy}/api/writes?delay=0",
+                         {"payload": "during-pause"})
+        check(code == 503 and rej.get("status") == "INTAKE_PAUSED",
+              "暂停期间新写入立即返回暂停状态（503 INTAKE_PAUSED）")
+        rej_id = rej.get("id")
+        _, s = http("GET", f"{proxy}/api/status")
+        check(all(w["id"] != rej_id for w in s["writes"]),
+              "被拒写入不落代理台账（writes 无记录）")
+        _, rec_a = http("GET", f"{proxy}/api/nodes/A/records")
+        _, rec_b = http("GET", f"{proxy}/api/nodes/B/records")
+        check(not any(r["id"] == rej_id
+                      for r in rec_a["records"] + rec_b["records"]),
+              "被拒写入不投任何后端")
+
+        active_now = s["active"]
+        code, swb = http("POST", f"{proxy}/api/switch",
+                         {"target": "B" if active_now == "A" else "A"})
+        check(code == 409 and swb.get("blocked"),
+              "暂停期间切流被禁止（409），现役节点不变")
+
+        _, s = http("GET", f"{proxy}/api/status")
+        blk_ids = [b["id"] for b in s["backup"]["blockers"]]
+        check(s["backup"]["ready"] is False and pid in blk_ids,
+              "在途写入阻塞静默：不显示可备份，且页面列出该在途写入")
+
+        slow.join(timeout=10)
+        check(slow.result and slow.result[0] == 201
+              and slow.result[1].get("node") == active_now,
+              "已受理的在途写入不受暂停影响，仍从原节点取回执")
+
+        ok = False
+        try:
+            ok = bool(wait_for(
+                lambda: http("GET", f"{proxy}/api/status")[1]["backup"]["ready"],
+                timeout=10, desc="backup ready"))
+        except AssertionError:
+            pass
+        check(ok, "全部确认后显示可备份（静默达成）")
+
+        code, rs = http("POST", f"{proxy}/api/resume")
+        check(code == 200 and rs.get("paused") is False, "值班员手动恢复接流")
+        code, w = http("POST", f"{proxy}/api/writes?delay=0",
+                       {"payload": "after-resume"})
+        check(code == 201, "恢复后新写入正常受理")
+
+        print("\n== 场景 8：暂停与并发写入交错 —— 受理边界清晰，已受理不丢 ==")
+        batch1 = [SlowPost(proxy, 0.5, f"race-accepted-{i}") for i in range(6)]
+        for t in batch1:
+            t.start()
+        ok6 = False
+        try:
+            ok6 = bool(wait_for(
+                lambda: sum(1 for w in http("GET", f"{proxy}/api/status")[1]["writes"]
+                            if w["status"] == "PENDING") >= 6,
+                timeout=8, desc="6 PENDING in flight"))
+        except AssertionError:
+            pass
+        check(ok6, "第一批 6 条并发写入全部受理在途")
+
+        # 暂停与第二批并发写入同时发出：每条要么完整受理，要么干净拒绝
+        batch2 = [SlowPost(proxy, 0, f"race-maybe-{i}") for i in range(8)]
+        for t in batch2:
+            t.start()
+        code, pz = http("POST", f"{proxy}/api/pause", {"note": "并发边界演练"})
+        check(code == 200 and pz.get("paused") is True, "并发写入中暂停成功")
+        for t in batch1 + batch2:
+            t.join(timeout=15)
+
+        acc1 = [t for t in batch1 if t.result and t.result[0] == 201]
+        check(len(acc1) == 6, "第一批已受理写入全部正常回执（暂停不丢已受理）",
+              f"{len(acc1)}/6")
+        acc2 = [t for t in batch2 if t.result and t.result[0] == 201]
+        rej2 = [t for t in batch2 if t.result and t.result[0] == 503]
+        check(len(acc2) + len(rej2) == 8,
+              f"第二批每条要么完整受理要么干净拒绝（受理 {len(acc2)} / 拒绝 {len(rej2)}）")
+
+        _, s = http("GET", f"{proxy}/api/status")
+        ledger = {w["id"] for w in s["writes"]}
+        _, rec_a = http("GET", f"{proxy}/api/nodes/A/records")
+        _, rec_b = http("GET", f"{proxy}/api/nodes/B/records")
+        backend_ids = ({r["id"] for r in rec_a["records"]}
+                       | {r["id"] for r in rec_b["records"]})
+        check(all(t.write_id not in ledger and t.write_id not in backend_ids
+                  for t in rej2),
+              "被拒写入：台账与两个后端都无任何痕迹")
+        check(all(t.write_id in ledger and t.write_id in backend_ids
+                  for t in acc2),
+              "交错中被受理的写入：台账与后端记录完整（受理边界清晰）")
+
+        # 暂停确认后到达的写入必须全部被拒（确定性）
+        batch3 = [SlowPost(proxy, 0, f"race-late-{i}") for i in range(4)]
+        for t in batch3:
+            t.start()
+        for t in batch3:
+            t.join(timeout=15)
+        rej3 = [t for t in batch3 if t.result and t.result[0] == 503]
+        _, s = http("GET", f"{proxy}/api/status")
+        ledger = {w["id"] for w in s["writes"]}
+        check(len(rej3) == 4
+              and all(t.write_id not in ledger for t in rej3),
+              "暂停生效后到达的写入全部被拒且不落台账", f"{len(rej3)}/4")
+        code, _ = http("POST", f"{proxy}/api/resume")
+        check(code == 200, "恢复接流")
+
+        print("\n== 场景 9：待核写入节点失联 —— 绝不误报可备份；恢复后可核实 ==")
+        _, s = http("GET", f"{proxy}/api/status")
+        active9 = s["active"]
+        code, tout = http("POST", f"{proxy}/api/writes?delay=5",
+                          {"payload": "lost-node-case"}, timeout=15)
+        check(code == 504 and tout.get("status") == "TIMEOUT_UNCERTAIN",
+              "构造一条结果不确定写入（读超时）")
+        tid, tnode = tout["id"], tout["node"]
+        http("POST", f"{proxy}/api/pause", {"note": "失联演练"})
+        # 直接杀掉该后端进程（断线），此时它的慢回执（5s）尚未完成
+        stop_proc(f"backend-{tnode.lower()}")
+        time.sleep(0.3)
+        _, s = http("GET", f"{proxy}/api/status")
+        blk = next((b for b in s["backup"]["blockers"] if b["id"] == tid), None)
+        check(blk is not None and blk["node_reachable"] is False
+              and s["backup"]["ready"] is False,
+              "节点失联：待核写入阻塞静默，页面标记节点不可达，不显示可备份")
+        code, ref = http("GET", f"{proxy}/api/writes/{tid}/refresh")
+        check(ref.get("refreshed") is False
+              and ref["write"]["status"] == "TIMEOUT_UNCERTAIN",
+              "失联时核实失败，不确定状态被保留（绝不清除）")
+        _, s = http("GET", f"{proxy}/api/status")
+        check(s["backup"]["ready"] is False, "失联期间任何时刻都不误报可备份")
+
+        # 恢复该后端（同一数据卷/DB 文件）：写入早已持久化，重启收尾补齐回执记账
+        respawn(f"backend-{tnode.lower()}")
+        check(wait_ready(f"http://127.0.0.1:{ports[tnode]}/healthz"),
+              f"后端 {tnode} 重启恢复（同一数据卷）")
+        code, ref = http("GET", f"{proxy}/api/writes/{tid}/refresh?wait=1",
+                         timeout=70)
+        check(ref["write"]["status"] == "ACKED",
+              "节点恢复后向原节点核实：写入确已落库，状态更正为 ACKED")
+        ok = False
+        try:
+            ok = bool(wait_for(
+                lambda: http("GET", f"{proxy}/api/status")[1]["backup"]["ready"],
+                timeout=10, desc="ready after heal"))
+        except AssertionError:
+            pass
+        check(ok, "全部确认后显示可备份")
+        http("POST", f"{proxy}/api/resume")
+
+        print("\n== 场景 10：代理重启 —— 暂停状态与待核记录仍有效，手动核实与恢复 ==")
+        _, s = http("GET", f"{proxy}/api/status")
+        active10 = s["active"]
+        slow = SlowPost(proxy, 6, "restart-inflight")
+        slow.start()
+        rid = None
+        try:
+            rid = wait_for(lambda: next(
+                (w["id"] for w in http("GET", f"{proxy}/api/status")[1]["writes"]
+                 if w["status"] == "PENDING"), None),
+                timeout=8, desc="PENDING before restart")
+        except AssertionError:
+            pass
+        check(bool(rid), "重启前构造一条在途写入")
+        # 确认后端已落库（该写入确已受理），再杀代理
+        okb = False
+        try:
+            okb = bool(wait_for(
+                lambda: any(r["id"] == rid for r in http(
+                    "GET", f"http://127.0.0.1:{ports[active10]}/records")[1]
+                    .get("records", [])),
+                timeout=8, desc="write persisted on backend"))
+        except AssertionError:
+            pass
+        check(okb, "在途写入已在原节点落库（确已受理）")
+        http("POST", f"{proxy}/api/pause", {"note": "重启演练"})
+        # SIGKILL 代理：模拟崩溃，在途 HTTP 连接中断，但台账与暂停状态已持久化
+        stop_proc("proxy", hard=True)
+        slow.join(timeout=10)
+        check(slow.result and slow.result[0] == 0,
+              "代理被杀：在途请求的客户端连接中断（预期现象）")
+        # 代理停机期间，白盒插入一条"已超时但从未到达后端"的不确定记录
+        # （模拟代理崩溃时请求已记账但未发出的窗口）
+        synth_id = str(uuid.uuid4())
+        con = sqlite3.connect(work / "proxy.db")
+        con.execute(
+            "INSERT INTO writes (id, target_node, payload, delay_hint, status, "
+            "status_detail, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (synth_id, active10, "synthetic-never-arrived", 0,
+             "TIMEOUT_UNCERTAIN", "simulated: request never reached backend",
+             time.time(), time.time()))
+        con.commit()
+        con.close()
+
+        respawn("proxy")
+        check(wait_ready(proxy + "/"), "代理重启（同一 SQLite 数据卷）")
+        _, s = http("GET", f"{proxy}/api/status")
+        check(s["pause"]["paused"] is True, "重启后暂停状态仍有效（未自动恢复）")
+        blk_ids = [b["id"] for b in s["backup"]["blockers"]]
+        check(rid in blk_ids and synth_id in blk_ids
+              and s["backup"]["ready"] is False,
+              "重启后待核记录仍有效：在途+不确定都继续阻塞静默")
+        code, rej = http("POST", f"{proxy}/api/writes?delay=0",
+                         {"payload": "post-restart"})
+        check(code == 503 and rej.get("status") == "INTAKE_PAUSED",
+              "重启后新写入仍被拒绝")
+        code, swb = http("POST", f"{proxy}/api/switch",
+                         {"target": "B" if active10 == "A" else "A"})
+        check(code == 409, "重启后切流仍被锁定")
+
+        # 手动核实：在途写入的后端慢回执（6s）用 wait=1 等它完成后确认
+        code, ref = http("GET", f"{proxy}/api/writes/{rid}/refresh?wait=1",
+                         timeout=70)
+        check(ref["write"]["status"] == "ACKED",
+              "重启后向原节点核实：在途写入最终回执，状态 ACKED（已受理不丢）")
+        code, ref2 = http("GET", f"{proxy}/api/writes/{synth_id}/refresh")
+        check(ref2["write"]["status"] == "NOT_ACCEPTED",
+              "原节点可达且无记录：确知未受理（NOT_ACCEPTED），不再阻塞")
+        ok = False
+        try:
+            ok = bool(wait_for(
+                lambda: http("GET", f"{proxy}/api/status")[1]["backup"]["ready"],
+                timeout=10, desc="ready after restart"))
+        except AssertionError:
+            pass
+        check(ok, "全部确认/确知未受理后显示可备份")
+        code, rs = http("POST", f"{proxy}/api/resume")
+        check(code == 200 and rs.get("paused") is False,
+              "值班员在网页手动恢复接流")
+        code, w = http("POST", f"{proxy}/api/writes?delay=0",
+                       {"payload": "post-restart-resume"})
+        check(code == 201, "恢复后写入正常")
+
+        print("\n== 场景 11：终态全量核对 ==")
+        _, s = http("GET", f"{proxy}/api/status")
+        _, rec_a = http("GET", f"{proxy}/api/nodes/A/records")
+        _, rec_b = http("GET", f"{proxy}/api/nodes/B/records")
+        ids_a = {r["id"] for r in rec_a["records"]}
+        ids_b = {r["id"] for r in rec_b["records"]}
+        check(ids_a.isdisjoint(ids_b), "A/B 后端写入 ID 集合仍不相交")
+        backend_ids = ids_a | ids_b
+        acked = {w["id"] for w in s["writes"] if w["status"] == "ACKED"}
+        check(acked == backend_ids, "所有 ACKED 写入与两侧后端记录一一对应",
+              f"ACKED={len(acked)} 后端={len(backend_ids)}")
+        ghost = [w["id"] for w in s["writes"]
+                 if w["status"] in ("FAILED", "NOT_ACCEPTED")
+                 and w["id"] in backend_ids]
+        check(not ghost, "FAILED/NOT_ACCEPTED 写入在任何后端都无记录")
+        left = [w["id"] for w in s["writes"]
+                if w["status"] in ("PENDING", "TIMEOUT_UNCERTAIN")]
+        check(not left, "测试结束时无残留待核写入")
+
     finally:
         print("\n== 清理进程 ==")
         for p in procs:
-            p.terminate()
+            if p.poll() is None:
+                p.terminate()
         for p in procs:
             try:
                 p.wait(timeout=8)

@@ -44,6 +44,12 @@ async def init_db() -> None:
             )
             """
         )
+        # 重启收尾：崩溃/重启前"已受理落库、但回执记账未完成"的行，此刻已没有任何
+        # 任务会为它们补回执；直接补齐 acked_at，避免在代理侧永远显示 pending。
+        await db.execute(
+            "UPDATE writes SET acked_at = ? WHERE acked_at IS NULL",
+            (time.time(),),
+        )
         await db.commit()
 
 

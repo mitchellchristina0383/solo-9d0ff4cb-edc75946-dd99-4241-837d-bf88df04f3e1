@@ -18,6 +18,12 @@ PENDING = "PENDING"        # 已送达/投递中，尚未拿到回执
 ACKED = "ACKED"            # 已拿到原节点成功回执
 TIMEOUT_UNCERTAIN = "TIMEOUT_UNCERTAIN"  # 写入已落库但回执超时，结果不确定
 FAILED = "FAILED"          # 节点明确拒绝（连接前失败/5xx），未送达
+NOT_ACCEPTED = "NOT_ACCEPTED"  # 确知未受理：原节点可达且确认无此记录
+
+# 阻止"备份静默"的状态：在途（待回执）与结果不确定。
+# 这些行只能经原节点核实转为 ACKED（确认）或 NOT_ACCEPTED（确知未受理），
+# 节点失联时保持原状，绝不自动清除。
+BLOCKING_STATUSES = (PENDING, TIMEOUT_UNCERTAIN)
 
 # 单连接 + 单写锁，SQLite 写入串行化，避免 lock 竞争。
 _conn: aiosqlite.Connection | None = None
@@ -46,6 +52,17 @@ async def init_db() -> None:
         CREATE TABLE IF NOT EXISTS route (
             id          INTEGER PRIMARY KEY CHECK (id = 1),
             active      TEXT NOT NULL,
+            updated_at  REAL NOT NULL
+        )
+        """
+    )
+    # 暂停接流状态：单行持久化，代理重启后仍然有效，只能由值班员手动恢复。
+    await _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pause (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            paused      INTEGER NOT NULL,
+            note        TEXT NOT NULL DEFAULT '',
             updated_at  REAL NOT NULL
         )
         """
@@ -119,6 +136,28 @@ async def set_active(name: str) -> None:
         await _conn.commit()
 
 
+async def get_pause() -> dict[str, Any]:
+    cur = await _conn.execute(
+        "SELECT paused, note, updated_at FROM pause WHERE id = 1"
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return {"paused": False, "note": "", "updated_at": None}
+    return {"paused": bool(row["paused"]), "note": row["note"],
+            "updated_at": row["updated_at"]}
+
+
+async def set_paused(paused: bool, note: str = "") -> None:
+    async with _write_lock:
+        await _conn.execute(
+            "INSERT INTO pause (id, paused, note, updated_at) VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET paused = excluded.paused, "
+            "note = excluded.note, updated_at = excluded.updated_at",
+            (1 if paused else 0, note, time.time()),
+        )
+        await _conn.commit()
+
+
 async def list_nodes() -> list[dict[str, Any]]:
     cur = await _conn.execute("SELECT name, base_url FROM nodes ORDER BY name")
     rows = await cur.fetchall()
@@ -180,6 +219,20 @@ async def get_write(write_id: str) -> dict[str, Any] | None:
 
 async def list_writes() -> list[dict[str, Any]]:
     cur = await _conn.execute("SELECT * FROM writes ORDER BY created_at DESC LIMIT 200")
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_blocking_writes() -> list[dict[str, Any]]:
+    """仍在阻止"备份静默"的写入：在途（PENDING）或结果不确定（TIMEOUT_UNCERTAIN）。
+
+    这是持久层口径——进程重启后内存态的在途集合丢失，仍以这些行作为
+    是否可备份的唯一依据。
+    """
+    cur = await _conn.execute(
+        "SELECT * FROM writes WHERE status IN (?, ?) ORDER BY created_at",
+        BLOCKING_STATUSES,
+    )
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
